@@ -56,6 +56,7 @@ class _MLRunEndPointClient(ABC):
 
     def __init__(
         self,
+        stream_profile_name: str,
         model_endpoint_name: str,
         model_endpoint_uid: str,
         serving_function: str | RemoteRuntime,
@@ -65,6 +66,9 @@ class _MLRunEndPointClient(ABC):
         """
         Initialize an MLRun model endpoint monitoring client.
 
+        :param stream_profile_name: The name of the registered datastore profile to use for stream configuration.
+            For MLRun CE, this should be a ``DatastoreProfileKafkaStream``.
+            For MLRun Enterprise, this should be a ``DatastoreProfileV3io``.
         :param model_endpoint_name: The monitoring endpoint related model name.
         :param model_endpoint_uid: Model endpoint unique identifier.
         :param serving_function: Serving function name or ``RemoteRuntime`` object.
@@ -73,6 +77,7 @@ class _MLRunEndPointClient(ABC):
         raise: MLRunInvalidArgumentError: If there is no current active project and no `project` argument was provided.
         """
         # Store the provided info:
+        self._stream_profile_name = stream_profile_name
         self._model_endpoint_name = model_endpoint_name
         self._model_endpoint_uid = model_endpoint_uid
 
@@ -187,27 +192,30 @@ class _V3IOMLRunEndPointClient(_MLRunEndPointClient):
 
     def __init__(
         self,
-        monitoring_stream_path: str,
-        monitoring_container: str,
+        stream_profile_name: str,
         model_endpoint_name: str,
         model_endpoint_uid: str,
         serving_function: str | RemoteRuntime,
         serving_function_tag: str | None = None,
         project: str | mlrun.projects.MlrunProject = None,
+        v3io_container: str | None = None,
+        v3io_stream_path: str | None = None,
     ):
         """
-        Initialize an MLRun model endpoint monitoring client.
+        Initialize an MLRun model endpoint monitoring client for V3IO.
 
-        :param monitoring_stream_path: V3IO stream path.
-        :param monitoring_container: V3IO container name.
+        :param stream_profile_name: The name of the registered ``DatastoreProfileV3io`` to use.
         :param model_endpoint_name: The monitoring endpoint related model name.
         :param model_endpoint_uid: Model endpoint unique identifier.
         :param serving_function: Serving function name or ``RemoteRuntime`` object.
         :param serving_function_tag: Optional function tag (defaults to 'latest').
         :param project: Project name or ``MlrunProject``. If ``None``, uses the current project.
+        :param v3io_container: Optional V3IO container name. Defaults to 'projects'.
+        :param v3io_stream_path: Optional V3IO stream path. Defaults to '{project}/model-endpoints/stream-v1'.
         raise: MLRunInvalidArgumentError: If there is no current active project and no `project` argument was provided.
         """
         super().__init__(
+            stream_profile_name=stream_profile_name,
             model_endpoint_name=model_endpoint_name,
             model_endpoint_uid=model_endpoint_uid,
             serving_function=serving_function,
@@ -217,12 +225,20 @@ class _V3IOMLRunEndPointClient(_MLRunEndPointClient):
 
         import v3io
 
-        # Store the provided info:
-        self._monitoring_stream_path = monitoring_stream_path
-        self._monitoring_container = monitoring_container
+        # Get project object:
+        project_obj = mlrun.get_or_create_project(self._project_name)
 
-        # Initialize a V3IO client:
-        self._v3io_client = v3io.Client()
+        # Fetch the stream profile and extract the access key:
+        stream_profile = project_obj.get_datastore_profile(self._stream_profile_name)
+        profile_attrs = stream_profile.attributes()
+        v3io_access_key = profile_attrs.get("v3io_access_key")
+
+        # Set V3IO monitoring stream paths (use provided values or defaults):
+        self._monitoring_container = v3io_container or "projects"
+        self._monitoring_stream_path = v3io_stream_path or f"{project_obj.name}/model-endpoints/stream-v1"
+
+        # Initialize a V3IO client with the access key from the profile:
+        self._v3io_client = v3io.Client(access_key=v3io_access_key)
 
     def monitor(
         self,
@@ -289,6 +305,7 @@ class _KafkaMLRunEndPointClient(_MLRunEndPointClient):
         raise: MLRunInvalidArgumentError: If there is no current active project and no `project` argument was provided.
         """
         super().__init__(
+            stream_profile_name=stream_profile_name,
             model_endpoint_name=model_endpoint_name,
             model_endpoint_uid=model_endpoint_uid,
             serving_function=serving_function,
@@ -304,7 +321,7 @@ class _KafkaMLRunEndPointClient(_MLRunEndPointClient):
         project_obj = mlrun.get_or_create_project(self._project_name)
 
         # Fetch the stream profile:
-        stream_profile = project_obj.get_datastore_profile(stream_profile_name)
+        stream_profile = project_obj.get_datastore_profile(self._stream_profile_name)
 
         # Get profile attributes and convert to producer config:
         profile_attrs = stream_profile.attributes()
@@ -370,21 +387,12 @@ class MLRunTracerClientSettings(BaseSettings):
     events to a specific model endpoint stream.
     """
 
-    v3io_stream_path: str | None = None
+    stream_profile_name: str = ...
     """
-    The V3IO stream path to send the events to.
-    """
-
-    v3io_container: str | None = None
-    """
-    The V3IO stream container.
-    """
-
-    stream_profile_name: str | None = None
-    """
-    The name of the registered DatastoreProfileKafkaStream to use for Kafka configuration.
-    This profile should be registered via ``project.register_datastore_profile()`` and contains
-    all Kafka settings including broker, topic, SASL credentials, SSL config, etc.
+    The name of the registered datastore profile to use for stream configuration.
+    For MLRun CE, this should be a ``DatastoreProfileKafkaStream``.
+    For MLRun Enterprise, this should be a ``DatastoreProfileV3io``.
+    The profile should be registered via ``project.register_datastore_profile()``.
     """
 
     model_endpoint_name: str = ...
@@ -412,25 +420,20 @@ class MLRunTracerClientSettings(BaseSettings):
     The MLRun project name related to the serving function and model endpoint.
     """
 
+    v3io_container: str | None = None
+    """
+    Optional V3IO container name for the monitoring stream (MLRun Enterprise only).
+    If not set, defaults to 'projects'.
+    """
+
+    v3io_stream_path: str | None = None
+    """
+    Optional V3IO stream path for the monitoring stream (MLRun Enterprise only).
+    If not set, defaults to '{project_name}/model-endpoints/stream-v1'.
+    """
+
     #: Pydantic model configuration to set the environment variable prefix.
     model_config = SettingsConfigDict(env_prefix="MLRUN_TRACER_CLIENT_")
-
-    @model_validator(mode='after')
-    def validate_stream_settings(self) -> 'MLRunTracerClientSettings':
-        """
-        Validate that either V3IO settings or stream profile name is provided, but not both or none.
-
-        :returns: The validated settings instance.
-        """
-        v3io_settings = all([self.v3io_container, self.v3io_stream_path])
-        kafka_settings = self.stream_profile_name is not None
-
-        if v3io_settings and kafka_settings:
-            raise ValueError("Cannot provide both V3IO and Kafka stream profile settings")
-        if not v3io_settings and not kafka_settings:
-            raise ValueError("Must provide either V3IO settings or stream_profile_name")
-
-        return self
 
 class MLRunTracerMonitorSettings(BaseSettings):
     """
@@ -740,13 +743,14 @@ class MLRunTracer(BaseTracer):
                 project=self._client_settings.project,
             )
         return _V3IOMLRunEndPointClient(
-            monitoring_stream_path=self._client_settings.v3io_stream_path,
-            monitoring_container=self._client_settings.v3io_container,
+            stream_profile_name=self._client_settings.stream_profile_name,
             model_endpoint_name=self._client_settings.model_endpoint_name,
             model_endpoint_uid=self._client_settings.model_endpoint_uid,
             serving_function=self._client_settings.serving_function,
             serving_function_tag=self._client_settings.serving_function_tag,
             project=self._client_settings.project,
+            v3io_container=self._client_settings.v3io_container,
+            v3io_stream_path=self._client_settings.v3io_stream_path,
         )
 
     def _import_custom_run_summarizer(self):
@@ -1142,9 +1146,9 @@ def setup_langchain_monitoring(
     function_name: str = "langchain_mlrun_function",
     model_name: str = "langchain_mlrun_model",
     model_endpoint_name: str = "langchain_mlrun_endpoint",
-    v3io_container: str = "projects",
-    v3io_stream_path: str = None,
     stream_profile_name: str = None,
+    v3io_container: str = None,
+    v3io_stream_path: str = None,
 ) -> dict:
     """
     Create a model endpoint in the given project to be used for LangChain monitoring with MLRun and returns the
@@ -1164,16 +1168,15 @@ def setup_langchain_monitoring(
     :param function_name: The name of the serving function to create.
     :param model_name: The name of the model to create.
     :param model_endpoint_name: The name of the model endpoint to create.
-    :param v3io_container: The V3IO container where the monitoring stream is located (for MLRun Enterprise).
-    :param v3io_stream_path: The V3IO stream path for monitoring (for MLRun Enterprise). If None,
-        ``<project.name>/model-endpoints/stream-v1`` will be used.
-    :param stream_profile_name: The name of the registered ``DatastoreProfileKafkaStream`` to use for Kafka
-        configuration (required for MLRun CE). This profile should be registered via
-        ``project.register_datastore_profile()`` and contains all Kafka settings including broker, topic,
-        SASL credentials, SSL config, etc.
+    :param stream_profile_name: The name of the registered datastore profile to use for stream configuration.
+        For MLRun CE, this should be a ``DatastoreProfileKafkaStream``.
+        For MLRun Enterprise, this should be a ``DatastoreProfileV3io``.
+        The profile should be registered via ``project.register_datastore_profile()``.
+    :param v3io_container: Optional V3IO container name (MLRun Enterprise only). Defaults to 'projects'.
+    :param v3io_stream_path: Optional V3IO stream path (MLRun Enterprise only). Defaults to
+        '{project}/model-endpoints/stream-v1'.
 
     :returns: A dictionary with the necessary environment variables to configure the MLRun tracer client.
-    raise: MLRunInvalidArgumentError: If no project is provided and there is no current active project.
     """
     import io
     import time
@@ -1395,23 +1398,13 @@ def handler(context, event):
                 if model_endpoint.metadata.uid:
                     uid_exist_flag = True
 
-    # Set parameters defaults:
-    v3io_stream_path = v3io_stream_path or f"{project.name}/model-endpoints/stream-v1"
-
-    if mlrun.mlconf.is_ce_mode():
-        if stream_profile_name is None:
-            raise ValueError(
-                "stream_profile_name is required for MLRun CE mode. "
-                "Register a DatastoreProfileKafkaStream and pass its name."
-            )
-        client_env_vars = {
-            "MLRUN_TRACER_CLIENT_STREAM_PROFILE_NAME": stream_profile_name,
-        }
-    else:
-        client_env_vars = {
-            "MLRUN_TRACER_CLIENT_V3IO_STREAM_PATH": v3io_stream_path,
-            "MLRUN_TRACER_CLIENT_V3IO_CONTAINER": v3io_container,
-        }
+    # Validate stream_profile_name is provided:
+    if stream_profile_name is None:
+        raise ValueError(
+            "stream_profile_name is required. "
+            "Register a datastore profile (DatastoreProfileKafkaStream for CE, "
+            "DatastoreProfileV3io for Enterprise) and pass its name."
+        )
 
     # Prepare the environment variables:
     env_vars = {
@@ -1420,8 +1413,15 @@ def handler(context, event):
         "MLRUN_TRACER_CLIENT_MODEL_ENDPOINT_NAME": model_endpoint.metadata.name,
         "MLRUN_TRACER_CLIENT_MODEL_ENDPOINT_UID": model_endpoint.metadata.uid,
         "MLRUN_TRACER_CLIENT_SERVING_FUNCTION": function_name,
-        **client_env_vars
+        "MLRUN_TRACER_CLIENT_STREAM_PROFILE_NAME": stream_profile_name,
     }
+
+    # Add optional V3IO settings if provided (MLRun Enterprise only):
+    if v3io_container:
+        env_vars["MLRUN_TRACER_CLIENT_V3IO_CONTAINER"] = v3io_container
+    if v3io_stream_path:
+        env_vars["MLRUN_TRACER_CLIENT_V3IO_STREAM_PATH"] = v3io_stream_path
+
     print("\n✨ Done! LangChain monitoring model endpoint created successfully.")
     print("You can now set the following environment variables to enable MLRun tracing in your LangChain code:\n")
     print(json.dumps(env_vars, indent=4))
