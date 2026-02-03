@@ -289,6 +289,7 @@ class _KafkaMLRunEndPointClient(_MLRunEndPointClient):
         serving_function: str | RemoteRuntime,
         serving_function_tag: str | None = None,
         project: str | mlrun.projects.MlrunProject = None,
+        kafka_linger_ms: int = 500,
     ):
         """
         Initialize an MLRun model endpoint monitoring client for Kafka.
@@ -301,6 +302,8 @@ class _KafkaMLRunEndPointClient(_MLRunEndPointClient):
         :param serving_function: Serving function name or ``RemoteRuntime`` object.
         :param serving_function_tag: Optional function tag (defaults to 'latest').
         :param project: Project name or ``MlrunProject``. If ``None``, uses the current project.
+        :param kafka_linger_ms: Kafka producer linger.ms setting (default: 500ms). Controls how long Kafka waits
+            to batch messages before sending. Higher values improve batching efficiency for agent monitoring.
         raise: MLRunInvalidArgumentError: If there is no current active project and no `project` argument was provided.
         """
         super().__init__(
@@ -333,10 +336,12 @@ class _KafkaMLRunEndPointClient(_MLRunEndPointClient):
         self._monitoring_topic = topics[0] if topics else get_kafka_topic(project_obj.name)
 
         # Initialize a Kafka producer with full config from profile:
+        # linger_ms controls batching - Kafka waits this long to accumulate messages before sending
         self._kafka_producer = KafkaProducer(
             bootstrap_servers=self._monitoring_broker,
             key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
             value_serializer=lambda v: v if isinstance(v, bytes) else orjson.dumps(v) if isinstance(v, dict) else str(v).encode("utf-8"),
+            linger_ms=kafka_linger_ms,
             **{k: v for k, v in producer_config.items() if k not in ["bootstrap_servers"]}
         )
 
@@ -405,6 +410,13 @@ class MLRunTracerClientSettings(BaseSettings):
     The name of the registered DatastoreProfileKafkaStream to use for Kafka configuration.
     This profile should be registered via ``project.register_datastore_profile()`` and contains
     all Kafka settings including broker, topic, SASL credentials, SSL config, etc.
+    """
+
+    kafka_linger_ms: int = 500
+    """
+    The Kafka producer linger.ms setting (default: 500ms). Controls how long Kafka waits to batch
+    messages before sending. This enables efficient batching for agent monitoring workloads.
+    Kafka handles delivery timing automatically - no explicit flush is needed.
     """
 
     model_endpoint_name: str = ...
@@ -757,6 +769,7 @@ class MLRunTracer(BaseTracer):
                 serving_function=self._client_settings.serving_function,
                 serving_function_tag=self._client_settings.serving_function_tag,
                 project=self._client_settings.project,
+                kafka_linger_ms=self._client_settings.kafka_linger_ms,
             )
         return _V3IOMLRunEndPointClient(
             monitoring_stream_path=self._client_settings.v3io_stream_path,
@@ -808,38 +821,19 @@ class MLRunTracer(BaseTracer):
         :param run: LangChain run object to process holding all the nested tree of runs.
         :param level: The nesting level of the run (0 for root runs, incremented for child runs).
         """
-        try:
-            # Serialize the run:
-            serialized_run = self._serialize_run(
-                run=run,
-                include_child_runs=not (self._settings.monitor.root_run_only or self._settings.monitor.split_runs)
-            )
+        # Serialize the run:
+        serialized_run = self._serialize_run(
+            run=run,
+            include_child_runs=not (self._settings.monitor.root_run_only or self._settings.monitor.split_runs)
+        )
 
-            # Check for a user custom run summarizer function:
-            if self._custom_run_summarizer_function:
-                for summarized_run in self._custom_run_summarizer_function(
-                    run, self._custom_run_summarizer_settings
-                ):
-                    if summarized_run:
-                        inputs, outputs = summarized_run
-                        self._send_run_event(
-                            event_id=serialized_run["id"],
-                            inputs=inputs,
-                            outputs=outputs,
-                            start_time=run.start_time,
-                            end_time=run.end_time,
-                        )
-                return
-
-            # Check how to deal with the child runs, monitor them in separate events or as a single event:
-            if self._monitor_settings.split_runs and not self._settings.monitor.root_run_only:
-                # Monitor as separate events:
-                for child_run in run.child_runs:
-                    self._persist_run(run=child_run, level=level + 1)
-                summarized_run = self._summarize_run(serialized_run=serialized_run, include_children=False)
+        # Check for a user custom run summarizer function:
+        if self._custom_run_summarizer_function:
+            for summarized_run in self._custom_run_summarizer_function(
+                run, self._custom_run_summarizer_settings
+            ):
                 if summarized_run:
                     inputs, outputs = summarized_run
-                    inputs["child_level"] = level
                     self._send_run_event(
                         event_id=serialized_run["id"],
                         inputs=inputs,
@@ -847,29 +841,42 @@ class MLRunTracer(BaseTracer):
                         start_time=run.start_time,
                         end_time=run.end_time,
                     )
-                return
+            return
 
-            # Monitor the root event (include child runs if `root_run_only` is False):
-            summarized_run = self._summarize_run(
-                serialized_run=serialized_run,
-                include_children=not self._monitor_settings.root_run_only
-            )
-            if not summarized_run:
-                return
-            inputs, outputs = summarized_run
-            inputs["child_level"] = level
-            self._send_run_event(
-                event_id=serialized_run["id"],
-                inputs=inputs,
-                outputs=outputs,
-                start_time=run.start_time,
-                end_time=run.end_time,
-            )
-        finally:
-            # Flush buffered messages after root run completion to ensure delivery
-            # without blocking on every single message:
-            if level == 0 and self._mlrun_client:
-                self._mlrun_client.flush()
+        # Check how to deal with the child runs, monitor them in separate events or as a single event:
+        if self._monitor_settings.split_runs and not self._settings.monitor.root_run_only:
+            # Monitor as separate events:
+            for child_run in run.child_runs:
+                self._persist_run(run=child_run, level=level + 1)
+            summarized_run = self._summarize_run(serialized_run=serialized_run, include_children=False)
+            if summarized_run:
+                inputs, outputs = summarized_run
+                inputs["child_level"] = level
+                self._send_run_event(
+                    event_id=serialized_run["id"],
+                    inputs=inputs,
+                    outputs=outputs,
+                    start_time=run.start_time,
+                    end_time=run.end_time,
+                )
+            return
+
+        # Monitor the root event (include child runs if `root_run_only` is False):
+        summarized_run = self._summarize_run(
+            serialized_run=serialized_run,
+            include_children=not self._monitor_settings.root_run_only
+        )
+        if not summarized_run:
+            return
+        inputs, outputs = summarized_run
+        inputs["child_level"] = level
+        self._send_run_event(
+            event_id=serialized_run["id"],
+            inputs=inputs,
+            outputs=outputs,
+            start_time=run.start_time,
+            end_time=run.end_time,
+        )
 
     def _serialize_run(self, run: Run, include_child_runs: bool) -> dict:
         """
@@ -1169,6 +1176,7 @@ def setup_langchain_monitoring(
     v3io_container: str = "projects",
     v3io_stream_path: str = None,
     kafka_stream_profile_name: str = None,
+    kafka_linger_ms: int = 500,
 ) -> dict:
     """
     Create a model endpoint in the given project to be used for LangChain monitoring with MLRun and returns the
@@ -1195,6 +1203,8 @@ def setup_langchain_monitoring(
         configuration (required for MLRun CE). This profile should be registered via
         ``project.register_datastore_profile()`` and contains all Kafka settings including broker, topic,
         SASL credentials, SSL config, etc.
+    :param kafka_linger_ms: Kafka producer linger.ms setting (default: 500ms). Controls how long Kafka waits
+        to batch messages before sending. Kafka handles delivery timing automatically.
 
     :returns: A dictionary with the necessary environment variables to configure the MLRun tracer client.
     raise: MLRunInvalidArgumentError: If no project is provided and there is no current active project.
@@ -1430,6 +1440,7 @@ def handler(context, event):
             )
         client_env_vars = {
             "MLRUN_TRACER_CLIENT_KAFKA_STREAM_PROFILE_NAME": kafka_stream_profile_name,
+            "MLRUN_TRACER_CLIENT_KAFKA_LINGER_MS": str(kafka_linger_ms),
         }
     else:
         client_env_vars = {
